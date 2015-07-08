@@ -1,10 +1,12 @@
+fn main() {}
+/*
 #![deny(warnings)]
 extern crate hyper;
 
 extern crate env_logger;
 
 use std::env;
-use std::io;
+use std::io::{self, Write};
 
 use hyper::Client;
 use hyper::header::Connection;
@@ -20,13 +22,25 @@ fn main() {
         }
     };
 
-    let client = Client::new();
-
-    let mut res = client.get(&*url)
+    let client = match Client::new() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Error creating Client: {}", e);
+            return;
+        }
+    };
+    client.get(&url)
         .header(Connection::close())
-        .send().unwrap();
-
-    println!("Response: {}", res.status);
-    println!("Headers:\n{}", res.headers);
-    io::copy(&mut res, &mut io::stdout()).unwrap();
+        .send(|res| {
+            println!("Response: {}", res.status());
+            println!("Headers:\n{}", res.headers());
+            res.stream(|bytes| {
+                match bytes {
+                    Ok(Some(bytes)) => io::stdout().write_all(bytes).unwrap(),
+                    Ok(None) => println!("\n\n\tdone."),
+                    Err(e) => println!("\n\n\tError reading response: {}", e)
+                }
+            })
+        });
 }
+*/

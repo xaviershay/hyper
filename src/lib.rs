@@ -1,6 +1,7 @@
 #![doc(html_root_url = "https://hyperium.github.io/hyper/")]
-#![cfg_attr(test, deny(missing_docs))]
-#![cfg_attr(test, deny(warnings))]
+//#![cfg_attr(test, deny(missing_docs))]
+//#![cfg_attr(test, deny(warnings))]
+//#![cfg_attr(test, deny(missing_debug_implementations))]
 #![cfg_attr(all(test, feature = "nightly"), feature(test))]
 
 //! # Hyper
@@ -142,6 +143,9 @@ extern crate num_cpus;
 extern crate traitobject;
 extern crate typeable;
 extern crate solicit;
+extern crate mio;
+extern crate eventual;
+extern crate tick;
 
 #[macro_use]
 extern crate language_tags;
@@ -159,7 +163,9 @@ extern crate test;
 pub use url::Url;
 pub use client::Client;
 pub use error::{Result, Error};
+pub use http::{Read};
 pub use method::Method::{Get, Head, Post, Delete};
+pub use net::{Fresh, Streaming};
 pub use status::StatusCode::{Ok, BadRequest, NotFound};
 pub use server::Server;
 pub use language_tags::LanguageTag;
@@ -179,10 +185,7 @@ macro_rules! inspect(
 );
 
 #[cfg(test)]
-#[macro_use]
 mod mock;
-#[doc(hidden)]
-pub mod buffer;
 pub mod client;
 pub mod error;
 pub mod method;
@@ -199,6 +202,7 @@ pub mod mime {
     pub use mime_crate::*;
 }
 
+/*
 #[allow(unconditional_recursion)]
 fn _assert_send<T: Send>() {
     _assert_send::<Client>();
@@ -212,3 +216,4 @@ fn _assert_sync<T: Sync>() {
     _assert_sync::<Client>();
     _assert_sync::<error::Error>();
 }
+*/

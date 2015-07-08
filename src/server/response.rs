@@ -2,18 +2,14 @@
 //!
 //! These are responses sent by a `hyper::Server` to clients, after
 //! receiving a request.
-use std::any::{Any, TypeId};
-use std::marker::PhantomData;
+use std::any::Any;
+use std::fmt;
 use std::mem;
-use std::io::{self, Write};
 use std::ptr;
 use std::thread;
 
-use time::now_utc;
-
 use header;
-use http::h1::{CR, LF, LINE_ENDING, HttpWriter};
-use http::h1::HttpWriter::{ThroughWriter, ChunkedWriter, SizedWriter, EmptyWriter};
+use http;
 use status;
 use net::{Fresh, Streaming};
 use version;
@@ -26,29 +22,35 @@ use version;
 /// There is a `Drop` implementation for `Response` that will automatically
 /// write the head and flush the body, if the handler has not already done so,
 /// so that the server doesn't accidentally leave dangling requests.
-#[derive(Debug)]
-pub struct Response<'a, W: Any = Fresh> {
-    /// The HTTP version of this response.
-    pub version: version::HttpVersion,
-    // Stream the Response is writing to, not accessible through UnwrittenResponse
-    body: HttpWriter<&'a mut (Write + 'a)>,
+pub struct Response<W: Any = Fresh> {
+    inner: Inner<W>,
+}
+
+struct Inner<W> {
+    version: version::HttpVersion,
     // The status code for the request.
     status: status::StatusCode,
     // The outgoing headers on this response.
-    headers: &'a mut header::Headers,
-
-    _writing: PhantomData<W>
+    headers: header::Headers,
+    stream: http::OutgoingStream<http::Response, W>,
 }
 
-impl<'a, W: Any> Response<'a, W> {
-    /// The status of this response.
-    #[inline]
-    pub fn status(&self) -> status::StatusCode { self.status }
+impl<W: Any> Response<W> {
 
     /// The headers of this response.
     #[inline]
-    pub fn headers(&self) -> &header::Headers { &*self.headers }
+    pub fn headers(&self) -> &header::Headers { &self.inner.headers }
 
+    /// The status of this response.
+    #[inline]
+    pub fn status(&self) -> status::StatusCode { self.inner.status }
+
+    /// The HTTP version of this response.
+    #[inline]
+    pub fn version(&self) -> &version::HttpVersion { &self.inner.version }
+
+
+    /*
     /// Construct a Response from its constituent parts.
     #[inline]
     pub fn construct(version: version::HttpVersion,
@@ -60,85 +62,53 @@ impl<'a, W: Any> Response<'a, W> {
             version: version,
             body: body,
             headers: headers,
-            _writing: PhantomData,
         }
     }
+    */
 
-    /// Deconstruct this Response into its constituent parts.
-    #[inline]
-    pub fn deconstruct(self) -> (version::HttpVersion, HttpWriter<&'a mut (Write + 'a)>,
-                                 status::StatusCode, &'a mut header::Headers) {
+    fn deconstruct(self) -> Inner<W> {
         unsafe {
-            let parts = (
-                self.version,
-                ptr::read(&self.body),
-                self.status,
-                ptr::read(&self.headers)
-            );
+            let inner = ptr::read(&self.inner);
             mem::forget(self);
-            parts
+            inner
         }
-    }
-
-    fn write_head(&mut self) -> io::Result<Body> {
-        debug!("writing head: {:?} {:?}", self.version, self.status);
-        try!(write!(&mut self.body, "{} {}{}{}", self.version, self.status,
-            CR as char, LF as char));
-
-        if !self.headers.has::<header::Date>() {
-            self.headers.set(header::Date(header::HttpDate(now_utc())));
-        }
-
-        let body_type = match self.status {
-            status::StatusCode::NoContent | status::StatusCode::NotModified => Body::Empty,
-            c if c.class() == status::StatusClass::Informational => Body::Empty,
-            _ => if let Some(cl) = self.headers.get::<header::ContentLength>() {
-                Body::Sized(**cl)
-            } else {
-                Body::Chunked
-            }
-        };
-
-        // can't do in match above, thanks borrowck
-        if body_type == Body::Chunked {
-            let encodings = match self.headers.get_mut::<header::TransferEncoding>() {
-                Some(&mut header::TransferEncoding(ref mut encodings)) => {
-                    //TODO: check if chunked is already in encodings. use HashSet?
-                    encodings.push(header::Encoding::Chunked);
-                    false
-                },
-                None => true
-            };
-
-            if encodings {
-                self.headers.set::<header::TransferEncoding>(
-                    header::TransferEncoding(vec![header::Encoding::Chunked]))
-            }
-        }
-
-
-        debug!("headers [\n{:?}]", self.headers);
-        try!(write!(&mut self.body, "{}", self.headers));
-        try!(write!(&mut self.body, "{}", LINE_ENDING));
-
-        Ok(body_type)
     }
 }
 
-impl<'a> Response<'a, Fresh> {
-    /// Creates a new Response that can be used to write to a network stream.
-    #[inline]
-    pub fn new(stream: &'a mut (Write + 'a), headers: &'a mut header::Headers) ->
-            Response<'a, Fresh> {
-        Response {
+/// Creates a new Response that can be used to write to a network stream.
+pub fn new(tx: http::OutgoingStream<http::Response, Fresh>) -> Response<Fresh> {
+    Response {
+        inner: Inner {
             status: status::StatusCode::Ok,
             version: version::HttpVersion::Http11,
-            headers: headers,
-            body: ThroughWriter(stream),
-            _writing: PhantomData,
-        }
+            headers: header::Headers::new(),
+            stream: tx,
+        },
     }
+}
 
+impl Response<Fresh> {
+    /// Get a mutable reference to the Headers.
+    #[inline]
+    pub fn headers_mut(&mut self) -> &mut header::Headers { &mut self.inner.headers }
+
+    /// Get a mutable reference to the status.
+    #[inline]
+    pub fn status_mut(&mut self) -> &mut status::StatusCode { &mut self.inner.status }
+
+    pub fn start<F>(self, callback: F) where F: FnOnce(::Result<Response<Streaming>>) + Send + 'static {
+        let inner = self.deconstruct();
+        inner.stream.start(inner.version, inner.status, inner.headers, move |result| {
+            callback(result.map(|(version, status, headers, stream)| Response {
+                inner: Inner {
+                    status: status,
+                    version: version,
+                    headers: headers,
+                    stream: stream
+                },
+            }));
+        });
+    }
     /// Writes the body and ends the response.
     ///
     /// This is a shortcut method for when you have a response with a fixed
@@ -148,12 +118,12 @@ impl<'a> Response<'a, Fresh> {
     ///
     /// ```
     /// # use hyper::server::Response;
-    /// fn handler(res: Response) {
-    ///     res.send(b"Hello World!").unwrap();
+    /// fn hello_world(res: Response) {
+    ///     res.send(b"Hello World!")
     /// }
     /// ```
     ///
-    /// The above is the same, but shorter, than the longer:
+    /// The above is a short for this longer form:
     ///
     /// ```
     /// # use hyper::server::Response;
@@ -162,116 +132,95 @@ impl<'a> Response<'a, Fresh> {
     /// fn handler(mut res: Response) {
     ///     let body = b"Hello World!";
     ///     res.headers_mut().set(ContentLength(body.len() as u64));
-    ///     let mut res = res.start().unwrap();
-    ///     res.write_all(body).unwrap();
+    ///     res.start().write(body);
     /// }
     /// ```
     #[inline]
-    pub fn send(mut self, body: &[u8]) -> io::Result<()> {
-        self.headers.set(header::ContentLength(body.len() as u64));
-        let mut stream = try!(self.start());
-        try!(stream.write_all(body));
-        stream.end()
+    pub fn send<T>(mut self, data: T) where T: AsRef<[u8]> + Send + 'static {
+        self.inner.headers.set(header::ContentLength(data.as_ref().len() as u64));
+        self.start(move |result| {
+            trace!("send on_complete");
+            match result {
+                Ok(streaming) => streaming.write_all(data, |_| ()),
+                Err(e) => error!("error starting request: {:?}", e)
+            }
+        });
     }
 
+    /*
     /// Consume this Response<Fresh>, writing the Headers and Status and
     /// creating a Response<Streaming>
-    pub fn start(mut self) -> io::Result<Response<'a, Streaming>> {
-        let body_type = try!(self.write_head());
-        let (version, body, status, headers) = self.deconstruct();
-        let stream = match body_type {
-            Body::Chunked => ChunkedWriter(body.into_inner()),
-            Body::Sized(len) => SizedWriter(body.into_inner(), len),
-            Body::Empty => EmptyWriter(body.into_inner()),
-        };
-
-        // "copy" to change the phantom type
-        Ok(Response {
+    pub fn start(self) -> Response<Streaming> {
+        let (version, body, status, mut headers) = self.deconstruct();
+        let body = body.start(version, status, &mut headers);
+        Response {
             version: version,
-            body: stream,
             status: status,
             headers: headers,
-            _writing: PhantomData,
-        })
+            body: body
+        }
     }
-    /// Get a mutable reference to the status.
-    #[inline]
-    pub fn status_mut(&mut self) -> &mut status::StatusCode { &mut self.status }
-
-    /// Get a mutable reference to the Headers.
-    #[inline]
-    pub fn headers_mut(&mut self) -> &mut header::Headers { self.headers }
+    */
 }
 
-
-impl<'a> Response<'a, Streaming> {
-    /// Flushes all writing of a response to the client.
-    #[inline]
-    pub fn end(self) -> io::Result<()> {
-        trace!("ending");
-        let (_, body, _, _) = self.deconstruct();
-        try!(body.end());
-        Ok(())
+impl Response<Streaming> {
+    pub fn write_all<T, F>(self, data: T, callback: F)
+    where T: AsRef<[u8]> + Send + 'static, F: FnOnce(::Result<Response<Streaming>>) + Send + 'static {
+        let stream = self.inner.stream.clone();
+        stream.write(::http::events::WriteAll::new(data, move |result| {
+            callback(result.map(move |_| self))
+        }));
     }
+    /*
+    /// Asynchronously write bytes to the response.
+    #[inline]
+    pub fn write(&mut self, data: &[u8]) {
+        self.stream.write(data)
+    }
+    */
+
+    //pub fn drain(&mut self, callback: F) -> Future {}
+
 }
 
-impl<'a> Write for Response<'a, Streaming> {
-    #[inline]
-    fn write(&mut self, msg: &[u8]) -> io::Result<usize> {
-        debug!("write {:?} bytes", msg.len());
-        self.body.write(msg)
-    }
-
-    #[inline]
-    fn flush(&mut self) -> io::Result<()> {
-        self.body.flush()
-    }
-}
-
-#[derive(PartialEq)]
-enum Body {
-    Chunked,
-    Sized(u64),
-    Empty,
-}
-
-impl<'a, T: Any> Drop for Response<'a, T> {
+impl<T: Any> Drop for Response<T> {
     fn drop(&mut self) {
+        use std::any::TypeId;
         if TypeId::of::<T>() == TypeId::of::<Fresh>() {
             if thread::panicking() {
                 self.status = status::StatusCode::InternalServerError;
             }
-
-            let mut body = match self.write_head() {
-                Ok(Body::Chunked) => ChunkedWriter(self.body.get_mut()),
-                Ok(Body::Sized(len)) => SizedWriter(self.body.get_mut(), len),
-                Ok(Body::Empty) => EmptyWriter(self.body.get_mut()),
-                Err(e) => {
-                    debug!("error dropping request: {:?}", e);
-                    return;
-                }
-            };
-            end(&mut body);
-        } else {
-            end(&mut self.body);
-        };
-
-
-        #[inline]
-        fn end<W: Write>(w: &mut W) {
-            match w.write(&[]) {
-                Ok(_) => match w.flush() {
-                    Ok(_) => debug!("drop successful"),
-                    Err(e) => debug!("error dropping request: {:?}", e)
-                },
-                Err(e) => debug!("error dropping request: {:?}", e)
-            }
+            let me: &mut Response<Fresh> = unsafe { mem::transmute(self) };
+            me.inner.headers.set(header::ContentLength(0));
+            let headers = mem::replace(&mut me.inner.headers, header::Headers::new());
+            let body = me.inner.stream.clone();
+            body.start(me.inner.version, me.inner.status, headers, |_| ());
         }
+
+        /*
+        //TODO: this should happen in http::OutgoingStream
+        // AsyncWriter will flush on drop
+        if !http::should_keep_alive(self.version, &self.headers) {
+            trace!("not keep alive, closing");
+            self.body.get_mut().get_mut().get_mut().close();
+        }
+        */
+    }
+}
+
+impl<T: Any> fmt::Debug for Response<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.inner.status)
+            .field("version", &self.inner.version)
+            .field("headers", &self.inner.headers)
+            .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /*
     use header::Headers;
     use mock::MockStream;
     use super::Response;
@@ -412,23 +361,5 @@ mod tests {
             "" // empty zero body
         }
     }
-
-    #[test]
-    fn test_no_content() {
-        use std::io::Write;
-        use status::StatusCode;
-        let mut headers = Headers::new();
-        let mut stream = MockStream::new();
-        {
-            let mut res = Response::new(&mut stream, &mut headers);
-            *res.status_mut() = StatusCode::NoContent;
-            res.start().unwrap();
-        }
-
-        lines! { stream =
-            "HTTP/1.1 204 No Content",
-            _date,
-            ""
-        }
-    }
+    */
 }

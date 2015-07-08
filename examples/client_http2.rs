@@ -1,3 +1,5 @@
+fn main() {}
+/*
 #![deny(warnings)]
 extern crate hyper;
 
@@ -32,3 +34,4 @@ fn main() {
     println!("Headers:\n{}", res.headers);
     io::copy(&mut res, &mut io::stdout()).unwrap();
 }
+*/

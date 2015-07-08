@@ -108,42 +108,39 @@
 //! `Response<Streaming>` object, that no longer has `headers_mut()`, but does
 //! implement `Write`.
 use std::fmt;
-use std::io::{self, ErrorKind, BufWriter, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::thread::{self, JoinHandle};
+use std::net::{SocketAddr/*, ToSocketAddrs*/};
+use std::thread;
+
 use std::time::Duration;
 
 use num_cpus;
+
+use mio::{TryAccept, Evented};
+use tick::{self, Tick, Transport};
 
 pub use self::request::Request;
 pub use self::response::Response;
 
 pub use net::{Fresh, Streaming};
 
-use Error;
-use buffer::BufReader;
-use header::{Headers, Expect, Connection};
+use header::Headers;
 use http;
 use method::Method;
-use net::{NetworkListener, NetworkStream, HttpListener, HttpsListener, Ssl};
+//use net::{HttpsListener, Ssl, HttpsStream};
 use status::StatusCode;
 use uri::RequestUri;
-use version::HttpVersion::Http11;
 
-use self::listener::ListenerPool;
-
-pub mod request;
-pub mod response;
-
-mod listener;
+mod request;
+mod response;
+mod conn;
 
 /// A server can listen on a TCP socket.
 ///
 /// Once listening, it will create a `Request`/`Response` pair for each
 /// incoming connection, and hand them to the provided handler.
 #[derive(Debug)]
-pub struct Server<L = HttpListener> {
-    listener: L,
+pub struct Server<T: TryAccept + Evented> {
+    listener: T,
     timeouts: Timeouts,
 }
 
@@ -154,6 +151,11 @@ struct Timeouts {
     keep_alive: Option<Duration>,
 }
 
+#[cfg(not(feature = "timeouts"))]
+#[derive(Clone, Copy, Default, Debug)]
+struct Timeouts;
+
+
 macro_rules! try_option(
     ($e:expr) => {{
         match $e {
@@ -163,10 +165,10 @@ macro_rules! try_option(
     }}
 );
 
-impl<L: NetworkListener> Server<L> {
+impl<T> Server<T> where T: TryAccept + Evented, <T as TryAccept>::Output: Transport {
     /// Creates a new server with the provided handler.
     #[inline]
-    pub fn new(listener: L) -> Server<L> {
+    pub fn new(listener: T) -> Server<T> {
         Server {
             listener: listener,
             timeouts: Timeouts::default(),
@@ -185,6 +187,12 @@ impl<L: NetworkListener> Server<L> {
         self.timeouts.keep_alive = Some(timeout);
     }
 
+    pub fn http(addr: &str) -> ::Result<Server> {
+        ::mio::tcp::TcpListener::bind(&addr.parse().unwrap())
+            .map(Server::new)
+            .map_err(From::from)
+    }
+
     #[cfg(feature = "timeouts")]
     pub fn set_read_timeout(&mut self, dur: Option<Duration>) {
         self.timeouts.read = dur;
@@ -196,23 +204,29 @@ impl<L: NetworkListener> Server<L> {
     }
 }
 
-impl Server<HttpListener> {
-    /// Creates a new server that will handle `HttpStream`s.
-    pub fn http<To: ToSocketAddrs>(addr: To) -> ::Result<Server<HttpListener>> {
-        HttpListener::new(addr).map(Server::new)
+impl Server<::mio::tcp::TcpListener> {
+    pub fn http(addr: &str) -> ::Result<Server<::mio::tcp::TcpListener>> {
+        ::mio::tcp::TcpListener::bind(&addr.parse().unwrap())
+            .map(Server::new)
+            .map_err(From::from)
     }
 }
 
-impl<S: Ssl + Clone + Send> Server<HttpsListener<S>> {
+
+/*
+impl<S: Ssl> Server<HttpsStream<S::Stream>> {
     /// Creates a new server that will handle `HttpStream`s over SSL.
     ///
     /// You can use any SSL implementation, as long as implements `hyper::net::Ssl`.
-    pub fn https<A: ToSocketAddrs>(addr: A, ssl: S) -> ::Result<Server<HttpsListener<S>>> {
+    pub fn https(addr: &SocketAddr, ssl: S) -> ::Result<Server<HttpsListener<S>>> {
         HttpsListener::new(addr, ssl).map(Server::new)
     }
 }
+*/
 
-impl<L: NetworkListener + Send + 'static> Server<L> {
+
+//impl<T: Transport> Server<T> {
+impl Server<::mio::tcp::TcpListener> {
     /// Binds to a socket and starts handling connections.
     pub fn handle<H: Handler + 'static>(self, handler: H) -> ::Result<Listening> {
         self.handle_threads(handler, num_cpus::get() * 5 / 4)
@@ -220,208 +234,84 @@ impl<L: NetworkListener + Send + 'static> Server<L> {
 
     /// Binds to a socket and starts handling connections with the provided
     /// number of threads.
-    pub fn handle_threads<H: Handler + 'static>(self, handler: H,
-            threads: usize) -> ::Result<Listening> {
-        handle(self, handler, threads)
+    pub fn handle_threads<H: Handler + 'static>(self, handler: H, threads: usize) -> ::Result<Listening> {
+        trace!("handle_threads {}", threads);
+        let handler = ::std::sync::Arc::new(handler);
+        let mut handles = vec![];
+        let mut ticks = vec![];
+        for _ in 0..threads {
+            let listener = try!(self.listener.try_clone());
+            let handler = handler.clone();
+            let mut tick = Tick::<::mio::tcp::TcpListener, _>::new(move |t, id| {
+                trace!("accepted {:?}", id);
+                let handler = handler.clone();
+                (http::Conn::new(t, conn::Conn::new(handler)), tick::Interest::Read)
+            });
+            ticks.push(tick.notify());
+            handles.push(thread::spawn(move || {
+                tick.accept(listener).unwrap();
+                tick.run().unwrap();
+            }));
+        }
+
+        Ok(Listening {
+            addr: try!(self.listener.local_addr()),
+            handles: Some(handles),
+            ticks: Some(ticks),
+        })
     }
 }
 
-fn handle<H, L>(mut server: Server<L>, handler: H, threads: usize) -> ::Result<Listening>
-where H: Handler + 'static, L: NetworkListener + Send + 'static {
-    let socket = try!(server.listener.local_addr());
-
-    debug!("threads = {:?}", threads);
-    let pool = ListenerPool::new(server.listener);
-    let worker = Worker::new(handler, server.timeouts);
-    let work = move |mut stream| worker.handle_connection(&mut stream);
-
-    let guard = thread::spawn(move || pool.accept(work, threads));
-
-    Ok(Listening {
-        _guard: Some(guard),
-        socket: socket,
-    })
-}
-
-struct Worker<H: Handler + 'static> {
-    handler: H,
-    timeouts: Timeouts,
-}
-
-impl<H: Handler + 'static> Worker<H> {
-    fn new(handler: H, timeouts: Timeouts) -> Worker<H> {
-        Worker {
-            handler: handler,
-            timeouts: timeouts,
-        }
-    }
-
-    fn handle_connection<S>(&self, mut stream: &mut S) where S: NetworkStream + Clone {
-        debug!("Incoming stream");
-
-        self.handler.on_connection_start();
-
-        if let Err(e) = self.set_timeouts(&*stream) {
-            error!("set_timeouts error: {:?}", e);
-            return;
-        }
-
-        let addr = match stream.peer_addr() {
-            Ok(addr) => addr,
-            Err(e) => {
-                error!("Peer Name error: {:?}", e);
-                return;
-            }
-        };
-
-        // FIXME: Use Type ascription
-        let stream_clone: &mut NetworkStream = &mut stream.clone();
-        let mut rdr = BufReader::new(stream_clone);
-        let mut wrt = BufWriter::new(stream);
-
-        while self.keep_alive_loop(&mut rdr, &mut wrt, addr) {
-            if let Err(e) = self.set_read_timeout(*rdr.get_ref(), self.timeouts.keep_alive) {
-                error!("set_read_timeout keep_alive {:?}", e);
-                break;
-            }
-        }
-
-        self.handler.on_connection_end();
-
-        debug!("keep_alive loop ending for {}", addr);
-    }
-
-    fn set_timeouts(&self, s: &NetworkStream) -> io::Result<()> {
-        try!(self.set_read_timeout(s, self.timeouts.read));
-        self.set_write_timeout(s, self.timeouts.write)
-    }
-
-    #[cfg(not(feature = "timeouts"))]
-    fn set_write_timeout(&self, _s: &NetworkStream, _timeout: Option<Duration>) -> io::Result<()> {
-        Ok(())
-    }
-
-    #[cfg(feature = "timeouts")]
-    fn set_write_timeout(&self, s: &NetworkStream, timeout: Option<Duration>) -> io::Result<()> {
-        s.set_write_timeout(timeout)
-    }
-
-    #[cfg(not(feature = "timeouts"))]
-    fn set_read_timeout(&self, _s: &NetworkStream, _timeout: Option<Duration>) -> io::Result<()> {
-        Ok(())
-    }
-
-    #[cfg(feature = "timeouts")]
-    fn set_read_timeout(&self, s: &NetworkStream, timeout: Option<Duration>) -> io::Result<()> {
-        s.set_read_timeout(timeout)
-    }
-
-    fn keep_alive_loop<W: Write>(&self, mut rdr: &mut BufReader<&mut NetworkStream>,
-            wrt: &mut W, addr: SocketAddr) -> bool {
-        let req = match Request::new(rdr, addr) {
-            Ok(req) => req,
-            Err(Error::Io(ref e)) if e.kind() == ErrorKind::ConnectionAborted => {
-                trace!("tcp closed, cancelling keep-alive loop");
-                return false;
-            }
-            Err(Error::Io(e)) => {
-                debug!("ioerror in keepalive loop = {:?}", e);
-                return false;
-            }
-            Err(e) => {
-                //TODO: send a 400 response
-                error!("request error = {:?}", e);
-                return false;
-            }
-        };
-
-        if !self.handle_expect(&req, wrt) {
-            return false;
-        }
-
-        if let Err(e) = req.set_read_timeout(self.timeouts.read) {
-            error!("set_read_timeout {:?}", e);
-            return false;
-        }
-
-        let mut keep_alive = self.timeouts.keep_alive.is_some() &&
-            http::should_keep_alive(req.version, &req.headers);
-        let version = req.version;
-        let mut res_headers = Headers::new();
-        if !keep_alive {
-            res_headers.set(Connection::close());
-        }
-        {
-            let mut res = Response::new(wrt, &mut res_headers);
-            res.version = version;
-            self.handler.handle(req, res);
-        }
-
-        // if the request was keep-alive, we need to check that the server agrees
-        // if it wasn't, then the server cannot force it to be true anyways
-        if keep_alive {
-            keep_alive = http::should_keep_alive(version, &res_headers);
-        }
-
-        debug!("keep_alive = {:?} for {}", keep_alive, addr);
-        keep_alive
-    }
-
-    fn handle_expect<W: Write>(&self, req: &Request, wrt: &mut W) -> bool {
-         if req.version == Http11 && req.headers.get() == Some(&Expect::Continue) {
-            let status = self.handler.check_continue((&req.method, &req.uri, &req.headers));
-            match write!(wrt, "{} {}\r\n\r\n", Http11, status) {
-                Ok(..) => (),
-                Err(e) => {
-                    error!("error writing 100-continue: {:?}", e);
-                    return false;
-                }
-            }
-
-            if status != StatusCode::Continue {
-                debug!("non-100 status ({}) for Expect 100 request", status);
-                return false;
-            }
-        }
-
-        true
-    }
-}
-
-/// A listening server, which can later be closed.
+/// A handle of the running server.
 pub struct Listening {
-    _guard: Option<JoinHandle<()>>,
-    /// The socket addresses that the server is bound to.
-    pub socket: SocketAddr,
+    /// The address this server is listening on.
+    pub addr: SocketAddr,
+    handles: Option<Vec<::std::thread::JoinHandle<()>>>,
+    ticks: Option<Vec<::tick::Notify>>
 }
 
 impl fmt::Debug for Listening {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Listening {{ socket: {:?} }}", self.socket)
+        f.debug_struct("Listening")
+            .field("addr", &self.addr)
+            .finish()
     }
 }
 
 impl Drop for Listening {
     fn drop(&mut self) {
-        let _ = self._guard.take().map(|g| g.join());
+        self.handles.take().map(|handles| {
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
     }
 }
 
 impl Listening {
+    /// Starts the Server, blocking until it is shutdown.
+    pub fn forever(self) {
+
+    }
     /// Stop the server from listening to its socket address.
-    pub fn close(&mut self) -> ::Result<()> {
-        let _ = self._guard.take();
+    pub fn close(mut self) {
         debug!("closing server");
-        Ok(())
+        self.handles.take(); // just dump the handles
+        self.ticks.take().map(|ticks| {
+            for tick in ticks {
+                tick.shutdown();
+            }
+        });
     }
 }
+
 
 /// A handler that can handle incoming requests for a server.
 pub trait Handler: Sync + Send {
     /// Receives a `Request`/`Response` pair, and should perform some action on them.
     ///
     /// This could reading from the request, and writing to the response.
-    fn handle<'a, 'k>(&'a self, Request<'a, 'k>, Response<'a, Fresh>);
+    fn handle(&self, Request, Response<Fresh>);
 
     /// Called when a Request includes a `Expect: 100-continue` header.
     ///
@@ -443,13 +333,14 @@ pub trait Handler: Sync + Send {
 }
 
 impl<F> Handler for F where F: Fn(Request, Response<Fresh>), F: Sync + Send {
-    fn handle<'a, 'k>(&'a self, req: Request<'a, 'k>, res: Response<'a, Fresh>) {
+    fn handle(&self, req: Request, res: Response<Fresh>) {
         self(req, res)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /*
     use header::Headers;
     use method::Method;
     use mock::MockStream;
@@ -484,7 +375,7 @@ mod tests {
     fn test_check_continue_reject() {
         struct Reject;
         impl Handler for Reject {
-            fn handle<'a, 'k>(&'a self, _: Request<'a, 'k>, res: Response<'a, Fresh>) {
+            fn handle(&self, _: Request, res: Response<Fresh>) {
                 res.start().unwrap().end().unwrap();
             }
 
@@ -505,4 +396,5 @@ mod tests {
         Worker::new(Reject, Default::default()).handle_connection(&mut mock);
         assert_eq!(mock.write, &b"HTTP/1.1 417 Expectation Failed\r\n\r\n"[..]);
     }
+    */
 }

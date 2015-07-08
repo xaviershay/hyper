@@ -4,17 +4,57 @@ use std::borrow::Cow;
 use header::Connection;
 use header::ConnectionOption::{KeepAlive, Close};
 use header::Headers;
+use method::Method;
+use uri::RequestUri;
 use version::HttpVersion;
 use version::HttpVersion::{Http10, Http11};
 
 #[cfg(feature = "serde-serialization")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use self::message::{HttpMessage, RequestHead, ResponseHead, Protocol};
+pub use self::conn::{Conn, Handler};
+pub use self::events::{Read, Write, Data};
 
+mod buffer;
+pub mod conn;
+pub mod events;
 pub mod h1;
-pub mod h2;
-pub mod message;
+//pub mod h2;
+
+// pub enum OutgoingStream { Http11(h1::OutgoingStream), Http2(h2::Outgoing) }
+pub use self::h1::IncomingStream;
+pub use self::h1::OutgoingStream;
+pub use self::h1::Decoder;
+
+/// Marker used with Streams to define semantics.
+#[derive(Debug)]
+pub enum Request {}
+/// Marker used with Streams to define semantics.
+#[derive(Debug)]
+pub enum Response {}
+
+/// An Incoming Message head. Includes request/status line, and headers.
+#[derive(Debug)]
+pub struct MessageHead<S> {
+    /// HTTP version of the message.
+    pub version: HttpVersion,
+    /// Subject (request line or status line) of Incoming message.
+    pub subject: S,
+    /// Headers of the Incoming message.
+    pub headers: Headers
+}
+
+/// An incoming request message.
+pub type RequestHead = MessageHead<(Method, RequestUri)>;
+
+/// An incoming response message.
+pub type ResponseHead = MessageHead<RawStatus>;
+
+impl<S> MessageHead<S> {
+    pub fn should_keep_alive(&self) -> bool {
+        should_keep_alive(self.version, &self.headers)
+    }
+}
 
 /// The raw status code and reason-phrase.
 #[derive(Clone, PartialEq, Debug)]
@@ -45,6 +85,18 @@ pub fn should_keep_alive(version: HttpVersion, headers: &Headers) -> bool {
         (Http11, Some(conn)) if conn.contains(&Close)  => false,
         _ => true
     }
+}
+
+pub trait Parse {
+    type Subject;
+    fn parse(bytes: &[u8]) -> ParseResult<Self::Subject>;
+    fn decoder(head: &MessageHead<Self::Subject>) -> ::Result<Decoder>;
+}
+
+pub type ParseResult<T> = ::Result<Option<(MessageHead<T>, usize)>>;
+
+pub fn parse<T: Parse<Subject=I>, I>(rdr: &[u8]) -> ParseResult<I> {
+    h1::parse::<T, I>(rdr)
 }
 
 #[test]
