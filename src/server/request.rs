@@ -2,125 +2,97 @@
 //!
 //! These are requests that a `hyper::Server` receives, and include its method,
 //! target URI, headers, and message body.
-use std::io::{self, Read};
-use std::net::SocketAddr;
-use std::time::Duration;
+//use std::net::SocketAddr;
 
-use buffer::BufReader;
-use net::NetworkStream;
-use version::{HttpVersion};
+use version::HttpVersion;
 use method::Method;
-use header::{Headers, ContentLength, TransferEncoding};
-use http::h1::{self, Incoming, HttpReader};
-use http::h1::HttpReader::{SizedReader, ChunkedReader, EmptyReader};
+use header::Headers;
+use http::{RequestHead, MessageHead};
 use uri::RequestUri;
 
+pub fn new(incoming: RequestHead) -> Request {
+    let MessageHead { version, subject: (method, uri), headers } = incoming;
+    debug!("Request Line: {:?} {:?} {:?}", method, uri, version);
+    debug!("{:#?}", headers);
+
+    Request {
+        //remote_addr: addr,
+        method: method,
+        uri: uri,
+        headers: headers,
+        version: version,
+    }
+}
+
 /// A request bundles several parts of an incoming `NetworkStream`, given to a `Handler`.
-pub struct Request<'a, 'b: 'a> {
-    /// The IP address of the remote connection.
-    pub remote_addr: SocketAddr,
-    /// The `Method`, such as `Get`, `Post`, etc.
-    pub method: Method,
-    /// The headers of the incoming request.
-    pub headers: Headers,
-    /// The target request-uri for this request.
-    pub uri: RequestUri,
-    /// The version of HTTP for this request.
-    pub version: HttpVersion,
-    body: HttpReader<&'a mut BufReader<&'b mut NetworkStream>>
+#[derive(Debug)]
+pub struct Request {
+    // The IP address of the remote connection.
+    //remote_addr: SocketAddr,
+    method: Method,
+    headers: Headers,
+    uri: RequestUri,
+    version: HttpVersion,
 }
 
 
-impl<'a, 'b: 'a> Request<'a, 'b> {
-    /// Create a new Request, reading the StartLine and Headers so they are
-    /// immediately useful.
-    pub fn new(mut stream: &'a mut BufReader<&'b mut NetworkStream>, addr: SocketAddr)
-        -> ::Result<Request<'a, 'b>> {
-
-        let Incoming { version, subject: (method, uri), headers } = try!(h1::parse_request(stream));
-        debug!("Request Line: {:?} {:?} {:?}", method, uri, version);
-        debug!("{:?}", headers);
-
-        let body = if headers.has::<ContentLength>() {
-            match headers.get::<ContentLength>() {
-                Some(&ContentLength(len)) => SizedReader(stream, len),
-                None => unreachable!()
-            }
-        } else if headers.has::<TransferEncoding>() {
-            todo!("check for Transfer-Encoding: chunked");
-            ChunkedReader(stream, None)
-        } else {
-            EmptyReader(stream)
-        };
-
-        Ok(Request {
-            remote_addr: addr,
-            method: method,
-            uri: uri,
-            headers: headers,
-            version: version,
-            body: body
-        })
-    }
-
-    /// Set the read timeout of the underlying NetworkStream.
+impl Request {
+    /// The `Method`, such as `Get`, `Post`, etc.
     #[inline]
-    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.body.get_ref().get_ref().set_read_timeout(timeout)
-    }
+    pub fn method(&self) -> &Method { &self.method }
 
-    /// Get a reference to the underlying `NetworkStream`.
+    /// The headers of the incoming request.
     #[inline]
-    pub fn downcast_ref<T: NetworkStream>(&self) -> Option<&T> {
-        self.body.get_ref().get_ref().downcast_ref()
-    }
+    pub fn headers(&self) -> &Headers { &self.headers }
 
-    /// Get a reference to the underlying Ssl stream, if connected
-    /// over HTTPS.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # extern crate hyper;
-    /// # #[cfg(feature = "openssl")]
-    /// extern crate openssl;
-    /// # #[cfg(feature = "openssl")]
-    /// use openssl::ssl::SslStream;
-    /// use hyper::net::HttpStream;
-    /// # fn main() {}
-    /// # #[cfg(feature = "openssl")]
-    /// # fn doc_ssl(req: hyper::server::Request) {
-    /// let maybe_ssl = req.ssl::<SslStream<HttpStream>>();
-    /// # }
-    /// ```
+    /// The target request-uri for this request.
     #[inline]
-    pub fn ssl<T: NetworkStream>(&self) -> Option<&T> {
-        use ::net::HttpsStream;
-        match self.downcast_ref() {
-            Some(&HttpsStream::Https(ref s)) => Some(s),
+    pub fn uri(&self) -> &RequestUri { &self.uri }
+
+    /// The version of HTTP for this request.
+    #[inline]
+    pub fn version(&self) -> &HttpVersion { &self.version }
+
+    /*
+    pub fn path(&self) -> Option<&str> {
+        match *self.uri {
+            RequestUri::AbsolutePath(ref s) => Some(s),
+            RequestUri::AbsoluteUri(ref url) => (),
             _ => None
         }
     }
 
-    /// Deconstruct a Request into its constituent parts.
-    #[inline]
-    pub fn deconstruct(self) -> (SocketAddr, Method, Headers,
-                                 RequestUri, HttpVersion,
-                                 HttpReader<&'a mut BufReader<&'b mut NetworkStream>>) {
-        (self.remote_addr, self.method, self.headers,
-         self.uri, self.version, self.body)
+    pub fn on_read<T: ::http::Read + Send + 'static>(self, callback: T) {
+        self.body.read(callback);
     }
+
+    pub fn read<F>(self, callback: F) where F: FnOnce(::Result<(&[u8], Self)>) + Send + 'static {
+        let stream = self.body.clone();
+        stream.read(::http::events::ReadOnce::new(move |result| {
+            callback(result.map(move |data| (data, self)))
+        }));
+    }
+
+    */
 }
 
-impl<'a, 'b> Read for Request<'a, 'b> {
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.body.read(buf)
+/*
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("uri", &self.uri)
+            .field("version", &self.version)
+            .field("headers", &self.headers)
+            .finish()
     }
 }
+*/
 
 #[cfg(test)]
 mod tests {
+
+    /*
     use buffer::BufReader;
     use header::{Host, TransferEncoding, Encoding};
     use net::NetworkStream;
@@ -320,6 +292,6 @@ mod tests {
         let req = Request::new(&mut stream, sock("127.0.0.1:80")).unwrap();
 
         assert_eq!(read_to_string(req).unwrap(), "1".to_owned());
-    }
+    }*/
 
 }

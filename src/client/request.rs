@@ -2,38 +2,39 @@
 use std::marker::PhantomData;
 use std::io::{self, Write};
 
-use std::time::Duration;
+//use std::time::Duration;
 
 use url::Url;
 
-use method::Method;
+use method::{self, Method};
 use header::Headers;
 use header::Host;
-use net::{NetworkStream, NetworkConnector, DefaultConnector, Fresh, Streaming};
+use http;
+use net::{NetworkConnector, DefaultConnector, Fresh, Streaming};
 use version;
 use client::{Response, get_host_and_port};
 
-use http::{HttpMessage, RequestHead};
-use http::h1::Http11Message;
 
 
 /// A client request to a remote server.
 /// The W type tracks the state of the request, Fresh vs Streaming.
 pub struct Request<W> {
-    /// The target URI for this request.
-    pub url: Url,
-
-    /// The HTTP version of this request.
-    pub version: version::HttpVersion,
-
-    message: Box<HttpMessage>,
+    url: Url,
+    version: version::HttpVersion,
     headers: Headers,
-    method: Method,
-
-    _marker: PhantomData<W>,
+    method: method::Method,
+    body: http::OutgoingStream<http::Request, W>,
 }
 
 impl<W> Request<W> {
+    /// Read the Request Url.
+    #[inline]
+    pub fn url(&self) -> &Url { &self.url }
+
+    /// Readthe Request Version.
+    #[inline]
+    pub fn version(&self) -> &version::HttpVersion { &self.version }
+
     /// Read the Request headers.
     #[inline]
     pub fn headers(&self) -> &Headers { &self.headers }
@@ -42,6 +43,7 @@ impl<W> Request<W> {
     #[inline]
     pub fn method(&self) -> Method { self.method.clone() }
 
+    /*
     /// Set the write timeout.
     #[inline]
     pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
@@ -53,70 +55,44 @@ impl<W> Request<W> {
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         self.message.set_read_timeout(dur)
     }
+    */
+}
+
+/// Create a new client request.
+pub fn new(method: method::Method, url: Url, body: http::OutgoingStream<http::Request, Fresh>) -> ::Result<Request<Fresh>> {
+    let (host, port) = try!(get_host_and_port(&url));
+    let mut headers = Headers::new();
+    headers.set(Host {
+        hostname: host,
+        port: Some(port),
+    });
+
+    Ok(Request {
+        method: method,
+        headers: headers,
+        url: url,
+        version: version::HttpVersion::Http11,
+        body: body,
+    })
 }
 
 impl Request<Fresh> {
-    /// Create a new `Request<Fresh>` that will use the given `HttpMessage` for its communication
-    /// with the server. This implies that the given `HttpMessage` instance has already been
-    /// properly initialized by the caller (e.g. a TCP connection's already established).
-    pub fn with_message(method: Method, url: Url, message: Box<HttpMessage>)
-            -> ::Result<Request<Fresh>> {
-        let (host, port) = try!(get_host_and_port(&url));
-        let mut headers = Headers::new();
-        headers.set(Host {
-            hostname: host,
-            port: Some(port),
-        });
-
-        Ok(Request {
-            method: method,
-            headers: headers,
-            url: url,
-            version: version::HttpVersion::Http11,
-            message: message,
-            _marker: PhantomData,
-        })
-    }
-
-    /// Create a new client request.
-    pub fn new(method: Method, url: Url) -> ::Result<Request<Fresh>> {
-        let conn = DefaultConnector::default();
-        Request::with_connector(method, url, &conn)
-    }
-
-    /// Create a new client request with a specific underlying NetworkStream.
-    pub fn with_connector<C, S>(method: Method, url: Url, connector: &C)
-        -> ::Result<Request<Fresh>> where
-        C: NetworkConnector<Stream=S>,
-        S: Into<Box<NetworkStream + Send>> {
-        let (host, port) = try!(get_host_and_port(&url));
-        let stream = try!(connector.connect(&*host, port, &*url.scheme)).into();
-
-        Request::with_message(method, url, Box::new(Http11Message::with_stream(stream)))
-    }
-
     /// Consume a Fresh Request, writing the headers and method,
     /// returning a Streaming Request.
-    pub fn start(mut self) -> ::Result<Request<Streaming>> {
-        let head = match self.message.set_outgoing(RequestHead {
-            headers: self.headers,
-            method: self.method,
-            url: self.url,
-        }) {
-            Ok(head) => head,
-            Err(e) => {
-                let _ = self.message.close_connection();
-                return Err(From::from(e));
-            }
-        };
+    pub fn start<F>(self, callback: F) where F: FnOnce(::Result<Request<Streaming>>) + Send + 'static {
+        let headers = self.headers;
+        let method = self.method;
+        let url = self.url;
+        let version = self.version;
 
-        Ok(Request {
-            method: head.method,
-            headers: head.headers,
-            url: head.url,
-            version: self.version,
-            message: self.message,
-            _marker: PhantomData,
+        self.body.start(method, url, headers, move |result| {
+            callback(result.map(move |(method, url, headers, body)| Request {
+                method: method,
+                headers: headers,
+                url: url,
+                version: version,
+                body: body
+            }))
         })
     }
 
@@ -129,37 +105,23 @@ impl Request<Streaming> {
     /// Completes writing the request, and returns a response to read from.
     ///
     /// Consumes the Request.
-    pub fn send(self) -> ::Result<Response> {
-        Response::with_message(self.url, self.message)
-    }
-}
-
-impl Write for Request<Streaming> {
-    #[inline]
-    fn write(&mut self, msg: &[u8]) -> io::Result<usize> {
-        match self.message.write(msg) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                let _ = self.message.close_connection();
-                Err(e)
-            }
-        }
+    pub fn response<F>(self, callback: F) where F: FnOnce(::Result<Response>) + Send + 'static {
+        unimplemented!()
     }
 
-    #[inline]
-    fn flush(&mut self) -> io::Result<()> {
-        match self.message.flush() {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                let _ = self.message.close_connection();
-                Err(e)
-            }
-        }
+    pub fn write_all<T, F>(self, data: T, callback: F)
+    where T: AsRef<[u8]> + Send + 'static, F: FnOnce(::Result<Request<Streaming>>) + Send + 'static {
+        let stream = self.body.clone();
+        stream.write(::http::events::WriteAll::new(data, move |result| {
+            callback(result.map(move |_| self))
+        }));
     }
+
 }
 
 #[cfg(test)]
 mod tests {
+    /*
     use std::io::Write;
     use std::str::from_utf8;
     use url::Url;
@@ -273,4 +235,5 @@ mod tests {
             .get_ref().downcast_ref::<MockStream>().unwrap()
             .is_closed);
     }
+    */
 }

@@ -59,64 +59,59 @@ use std::default::Default;
 use std::io::{self, copy, Read};
 use std::iter::Extend;
 
-use std::time::Duration;
+use httparse; //TODO: this is leaked out of the http module
+use tick;
 
 use url::UrlParser;
 use url::ParseError as UrlError;
 
 use header::{Headers, Header, HeaderFormat};
 use header::{ContentLength, Location};
+use http;
 use method::Method;
-use net::{NetworkConnector, NetworkStream};
+use net::{NetworkConnector, Fresh, DefaultConnector};
 use {Url};
 use Error;
 
-pub use self::pool::Pool;
+//use self::pool::Pool;
 pub use self::request::Request;
 pub use self::response::Response;
 
-pub mod pool;
-pub mod request;
-pub mod response;
+//mod pool;
+mod request;
+mod response;
 
-use http::Protocol;
-use http::h1::Http11Protocol;
 
 /// A Client to use additional features with Requests.
 ///
 /// Clients can handle things such as: redirect policy, connection pooling.
-pub struct Client {
-    protocol: Box<Protocol + Send + Sync>,
+pub struct Client<C: NetworkConnector = DefaultConnector> {
+    connector: C,
+    //tick: tick::Tick<C::Stream, Factory>,
     redirect_policy: RedirectPolicy,
-    read_timeout: Option<Duration>,
-    write_timeout: Option<Duration>,
 }
 
-impl Client {
+/*
+pub struct ClientConfig {
 
+}
+*/
+
+impl Client {
     /// Create a new Client.
     pub fn new() -> Client {
-        Client::with_pool_config(Default::default())
+        Client::with_connector(DefaultConnector::default())
     }
+}
 
-    /// Create a new Client with a configured Pool Config.
-    pub fn with_pool_config(config: pool::Config) -> Client {
-        Client::with_connector(Pool::new(config))
-    }
+impl<C: NetworkConnector> Client<C> {
 
     /// Create a new client with a specific connector.
-    pub fn with_connector<C, S>(connector: C) -> Client
-    where C: NetworkConnector<Stream=S> + Send + Sync + 'static, S: NetworkStream + Send {
-        Client::with_protocol(Http11Protocol::with_connector(connector))
-    }
-
-    /// Create a new client with a specific `Protocol`.
-    pub fn with_protocol<P: Protocol + Send + Sync + 'static>(protocol: P) -> Client {
+    pub fn with_connector(connector: C) -> Client<C> {
         Client {
-            protocol: Box::new(protocol),
-            redirect_policy: Default::default(),
-            read_timeout: None,
-            write_timeout: None,
+            connector: connector,
+            //tick: tick::Tick::new(Factory),
+            redirect_policy: RedirectPolicy::default(),
         }
     }
 
@@ -125,69 +120,84 @@ impl Client {
         self.redirect_policy = policy;
     }
 
-    /// Set the read timeout value for all requests.
-    pub fn set_read_timeout(&mut self, dur: Option<Duration>) {
-        self.read_timeout = dur;
-    }
-
-    /// Set the write timeout value for all requests.
-    pub fn set_write_timeout(&mut self, dur: Option<Duration>) {
-        self.write_timeout = dur;
-    }
-
     /// Build a Get request.
-    pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+    pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
         self.request(Method::Get, url)
     }
 
     /// Build a Head request.
-    pub fn head<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+    pub fn head<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
         self.request(Method::Head, url)
     }
 
     /// Build a Patch request.
-    pub fn patch<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+    pub fn patch<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
         self.request(Method::Patch, url)
     }
 
     /// Build a Post request.
-    pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+    pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
         self.request(Method::Post, url)
     }
 
     /// Build a Put request.
-    pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+    pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
         self.request(Method::Put, url)
     }
 
     /// Build a Delete request.
-    pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+    pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
         self.request(Method::Delete, url)
     }
 
 
     /// Build a new request using this Client.
-    pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
+    pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder<C> {
         RequestBuilder {
             client: self,
             method: method,
             url: url.into_url(),
-            body: None,
             headers: None,
         }
     }
+
+    /*
+    fn stream(&self, transport: T, outgoing: (Method, Url, Headers)) {
+        self.tick.stream(transport)
+    }
+    */
 }
 
-impl Default for Client {
-    fn default() -> Client { Client::new() }
+/*
+struct Factory;
+
+impl tick::ProtocolFactory for Factory {
+    type Protocol = http::Conn<Handler>;
+    fn create(&mut self, transfer: tick::Transfer, id: tick::Id) -> Self::Protocol {
+        trace!("Factory.create {:?}", id);
+        http::Conn::new(transfer, Handler)
+    }
 }
+
+struct Handler;
+
+impl http::Handler for Handler {
+    type Incoming = httparse::Response<'static, 'static>;
+    type Outgoing = http::Request;
+
+    fn on_incoming(&mut self, incoming: http::IncomingResponse, stream: http::Stream,
+                  transfer: http::Transfer<http::Request, Fresh>) {
+        let resp = response::new(incoming, stream);
+    }
+}
+*/
 
 /// Options for an individual Request.
 ///
 /// One of these will be built for you if you use one of the convenience
 /// methods, such as `get()`, `post()`, etc.
-pub struct RequestBuilder<'a> {
-    client: &'a Client,
+pub struct RequestBuilder<'a, C: NetworkConnector + 'a> {
+    client: &'a Client<C>,
     // We store a result here because it's good to keep RequestBuilder
     // from being generic, but it is a nicer API to report the error
     // from `send` (when other errors may be happening, so it already
@@ -200,25 +210,27 @@ pub struct RequestBuilder<'a> {
     url: Result<Url, UrlError>,
     headers: Option<Headers>,
     method: Method,
-    body: Option<Body<'a>>,
+    //body: Option<Body<'a>>,
 }
 
-impl<'a> RequestBuilder<'a> {
+impl<'a, C: NetworkConnector> RequestBuilder<'a, C> {
 
+    /*
     /// Set a request body to be sent.
     pub fn body<B: Into<Body<'a>>>(mut self, body: B) -> RequestBuilder<'a> {
         self.body = Some(body.into());
         self
     }
+    */
 
     /// Add additional headers to the request.
-    pub fn headers(mut self, headers: Headers) -> RequestBuilder<'a> {
+    pub fn headers(mut self, headers: Headers) -> RequestBuilder<'a, C> {
         self.headers = Some(headers);
         self
     }
 
     /// Add an individual new header to the request.
-    pub fn header<H: Header + HeaderFormat>(mut self, header: H) -> RequestBuilder<'a> {
+    pub fn header<H: Header + HeaderFormat>(mut self, header: H) -> RequestBuilder<'a, C> {
         {
             let mut headers = match self.headers {
                 Some(ref mut h) => h,
@@ -234,13 +246,62 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Execute this request and receive a Response back.
-    pub fn send(self) -> ::Result<Response> {
-        let RequestBuilder { client, method, url, headers, body } = self;
-        let mut url = try!(url);
+    pub fn send<F>(self, cb: F) where F: FnOnce(::Result<Response>) + Send + 'static {
+        self.connect(move |result| {
+            match result {
+                Ok(request) => request.start(move |result| {
+                    match result {
+                        Ok(request) => request.response(cb),
+                        Err(e) => cb(Err(e))
+                    }
+                }),
+                Err(e) => cb(Err(e))
+            }
+        })
+    }
+
+    fn connect<F>(self, callback: F) where F: FnOnce(::Result<Request<Fresh>>) + Send + 'static {
+        match self.try_connect() {
+            Ok(_) => (),
+            Err(e) => return callback(Err(e))
+        }
+        //let mut req = try!(request::new(method, url, transfer));
+        //req.headers_mut().extend(headers);
+        //Ok(req)
+        unimplemented!()
+    }
+
+    fn try_connect(self) -> ::Result<()> {
+        let RequestBuilder { client, method, url, headers } = self;
+        let url = try!(url);
         trace!("send {:?} {:?}", method, url);
 
+<<<<<<< HEAD
         let can_have_body = match method {
             Method::Get | Method::Head => false,
+=======
+        let transport = {
+            let (host, port) = try!(get_host_and_port(&url));
+            // let key = key(host, port, url.scheme);
+            // let transfer = match client.pool.remove(key) {
+            //     Some(transfer) => transfer,
+            //     None => try!(client.connector.connect(&host, port, &*url.scheme))
+            // };
+            // transfer.start(method, url, headers)
+            try!(client.connector.connect(&host, port, &*url.scheme))
+        };
+        unimplemented!()
+        //let id = try!(client.tick.stream(transport));
+        //Ok((id, method, url, headers))
+    }
+
+    /*
+    fn _send(self) -> ::Result<Response> {
+        let mut url = try!(url.into_url());
+
+        let can_have_body = match &method {
+            &Method::Get | &Method::Head => false,
+>>>>>>> e3e42b5... mio wip
             _ => true
         };
 
@@ -251,10 +312,6 @@ impl<'a> RequestBuilder<'a> {
         };
 
         loop {
-            let message = {
-                let (host, port) = try!(get_host_and_port(&url));
-                try!(client.protocol.new_message(&host, port, &*url.scheme))
-            };
             let mut req = try!(Request::with_message(method.clone(), url.clone(), message));
             headers.as_ref().map(|headers| req.headers_mut().extend(headers.iter()));
 
@@ -309,8 +366,10 @@ impl<'a> RequestBuilder<'a> {
             }
         }
     }
+    */
 }
 
+/*
 /// An enum of possible body types for a Request.
 pub enum Body<'a> {
     /// A Reader does not necessarily know it's size, so it is chunked.
@@ -369,6 +428,7 @@ impl<'a, R: Read> From<&'a mut R> for Body<'a> {
         Body::ChunkedBody(r)
     }
 }
+*/
 
 /// A helper trait to convert common objects into a Url.
 pub trait IntoUrl {
@@ -434,6 +494,7 @@ fn get_host_and_port(url: &Url) -> ::Result<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
+    /*
     use std::io::Read;
     use header::Server;
     use super::{Client, RedirectPolicy};
@@ -511,4 +572,5 @@ mod tests {
         client.post("http://127.0.0.1").send().unwrap().read_to_string(&mut s).unwrap();
         assert_eq!(s, "POST");
     }
+    */
 }

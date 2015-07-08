@@ -8,6 +8,7 @@ use std::string::FromUtf8Error;
 use httparse;
 use url;
 use solicit::http::HttpError as Http2Error;
+use tick::Error as TickError;
 
 #[cfg(feature = "openssl")]
 use openssl::ssl::error::SslError;
@@ -21,6 +22,7 @@ use self::Error::{
     Io,
     Ssl,
     TooLarge,
+    Incomplete,
     Http2,
     Utf8
 };
@@ -42,6 +44,8 @@ pub enum Error {
     Header,
     /// A message head is too large to be reasonable.
     TooLarge,
+    /// A message reached EOF before being a complete message.
+    Incomplete,
     /// An invalid `Status`, such as `1337 ELITE`.
     Status,
     /// An `io::Error` that occurred while trying to read or write to a network stream.
@@ -80,6 +84,7 @@ impl StdError for Error {
             Header => "Invalid Header provided",
             TooLarge => "Message head is too large",
             Status => "Invalid Status provided",
+            Incomplete => "Message is incomplete",
             Uri(ref e) => e.description(),
             Io(ref e) => e.description(),
             Ssl(ref e) => e.description(),
@@ -154,12 +159,23 @@ impl From<Http2Error> for Error {
     }
 }
 
+impl From<TickError> for Error {
+    fn from(err: TickError) -> Error {
+        match err {
+            TickError::Io(e) => Error::Io(e),
+            TickError::TooManySockets => panic!("too many sockets, what do i do"),
+            TickError::Timeout => panic!("too many timeouts, what do i do")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
     use std::io;
     use httparse;
     use solicit::http::HttpError as Http2Error;
+    use tick::Error as TickError;
     use url;
     use super::Error;
     use super::Error::*;
@@ -211,6 +227,7 @@ mod tests {
         from!(httparse::Error::Token => Header);
         from!(httparse::Error::TooManyHeaders => TooLarge);
         from!(httparse::Error::Version => Version);
+        from!(TickError::Io(io::Error::new(io::ErrorKind::Other, "tickerror")) => Io(..));
     }
 
     #[cfg(feature = "openssl")]
