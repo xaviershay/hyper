@@ -1,39 +1,32 @@
 //! Client Requests
-use std::marker::PhantomData;
-use std::io::{self, Write};
-
-//use std::time::Duration;
 
 use url::Url;
 
-use method::{self, Method};
+use method::Method;
 use header::Headers;
 use header::Host;
-use http;
-use net::{NetworkConnector, DefaultConnector, Fresh, Streaming};
-use version;
-use client::{Response, get_host_and_port};
+use net::{NetworkConnector, DefaultConnector};
+use version::HttpVersion;
+use client::{get_host_and_port};
 
 
 
 /// A client request to a remote server.
-/// The W type tracks the state of the request, Fresh vs Streaming.
-pub struct Request<W> {
+pub struct Request {
+    method: Method,
     url: Url,
-    version: version::HttpVersion,
+    version: HttpVersion,
     headers: Headers,
-    method: method::Method,
-    body: http::OutgoingStream<http::Request, W>,
 }
 
-impl<W> Request<W> {
+impl Request {
     /// Read the Request Url.
     #[inline]
     pub fn url(&self) -> &Url { &self.url }
 
     /// Readthe Request Version.
     #[inline]
-    pub fn version(&self) -> &version::HttpVersion { &self.version }
+    pub fn version(&self) -> &HttpVersion { &self.version }
 
     /// Read the Request headers.
     #[inline]
@@ -41,7 +34,11 @@ impl<W> Request<W> {
 
     /// Read the Request method.
     #[inline]
-    pub fn method(&self) -> Method { self.method.clone() }
+    pub fn method(&self) -> &Method { &self.method }
+
+    /// Get a mutable reference to the Request headers.
+    #[inline]
+    pub fn headers_mut(&mut self) -> &mut Headers { &mut self.headers }
 
     /*
     /// Set the write timeout.
@@ -59,7 +56,7 @@ impl<W> Request<W> {
 }
 
 /// Create a new client request.
-pub fn new(method: method::Method, url: Url, body: http::OutgoingStream<http::Request, Fresh>) -> ::Result<Request<Fresh>> {
+pub fn new(method: Method, url: Url) -> ::Result<Request> {
     let (host, port) = try!(get_host_and_port(&url));
     let mut headers = Headers::new();
     headers.set(Host {
@@ -71,52 +68,8 @@ pub fn new(method: method::Method, url: Url, body: http::OutgoingStream<http::Re
         method: method,
         headers: headers,
         url: url,
-        version: version::HttpVersion::Http11,
-        body: body,
+        version: HttpVersion::Http11,
     })
-}
-
-impl Request<Fresh> {
-    /// Consume a Fresh Request, writing the headers and method,
-    /// returning a Streaming Request.
-    pub fn start<F>(self, callback: F) where F: FnOnce(::Result<Request<Streaming>>) + Send + 'static {
-        let headers = self.headers;
-        let method = self.method;
-        let url = self.url;
-        let version = self.version;
-
-        self.body.start(method, url, headers, move |result| {
-            callback(result.map(move |(method, url, headers, body)| Request {
-                method: method,
-                headers: headers,
-                url: url,
-                version: version,
-                body: body
-            }))
-        })
-    }
-
-    /// Get a mutable reference to the Request headers.
-    #[inline]
-    pub fn headers_mut(&mut self) -> &mut Headers { &mut self.headers }
-}
-
-impl Request<Streaming> {
-    /// Completes writing the request, and returns a response to read from.
-    ///
-    /// Consumes the Request.
-    pub fn response<F>(self, callback: F) where F: FnOnce(::Result<Response>) + Send + 'static {
-        unimplemented!()
-    }
-
-    pub fn write_all<T, F>(self, data: T, callback: F)
-    where T: AsRef<[u8]> + Send + 'static, F: FnOnce(::Result<Request<Streaming>>) + Send + 'static {
-        let stream = self.body.clone();
-        stream.write(::http::events::WriteAll::new(data, move |result| {
-            callback(result.map(move |_| self))
-        }));
-    }
-
 }
 
 #[cfg(test)]

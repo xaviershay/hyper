@@ -59,7 +59,6 @@ use std::default::Default;
 use std::io::{self, copy, Read};
 use std::iter::Extend;
 
-use httparse; //TODO: this is leaked out of the http module
 use tick;
 
 use url::UrlParser;
@@ -69,7 +68,7 @@ use header::{Headers, Header, HeaderFormat};
 use header::{ContentLength, Location};
 use http;
 use method::Method;
-use net::{NetworkConnector, Fresh, DefaultConnector};
+use net::{Transport, NetworkConnector, DefaultConnector};
 use {Url};
 use Error;
 
@@ -120,52 +119,23 @@ impl<C: NetworkConnector> Client<C> {
         self.redirect_policy = policy;
     }
 
-    /// Build a Get request.
-    pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
-        self.request(Method::Get, url)
-    }
-
-    /// Build a Head request.
-    pub fn head<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
-        self.request(Method::Head, url)
-    }
-
-    /// Build a Patch request.
-    pub fn patch<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
-        self.request(Method::Patch, url)
-    }
-
-    /// Build a Post request.
-    pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
-        self.request(Method::Post, url)
-    }
-
-    /// Build a Put request.
-    pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
-        self.request(Method::Put, url)
-    }
-
-    /// Build a Delete request.
-    pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder<C> {
-        self.request(Method::Delete, url)
-    }
-
-
-    /// Build a new request using this Client.
-    pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder<C> {
-        RequestBuilder {
-            client: self,
-            method: method,
-            url: url.into_url(),
-            headers: None,
-        }
-    }
-
     /*
+    /// Build a new request using this Client.
+    pub fn request<U: IntoUrl>(&self, url: U, handler: H) {
+        let url = url.into_url().unwrap()
+    }
+
     fn stream(&self, transport: T, outgoing: (Method, Url, Headers)) {
         self.tick.stream(transport)
     }
     */
+}
+
+pub trait Handler<T: Transport>: Send + 'static {
+    fn on_request(&mut self, request: &mut Request) -> http::Next;
+    fn on_request_writable(&mut self, request: &mut http::Encoder<T>) -> http::Next;
+    fn on_response(&mut self, response: Response) -> http::Next;
+    fn on_response_readable(&mut self, response: &mut http::Decoder<T>) -> http::Next;
 }
 
 /*
@@ -178,122 +148,37 @@ impl tick::ProtocolFactory for Factory {
         http::Conn::new(transfer, Handler)
     }
 }
-
-struct Handler;
-
-impl http::Handler for Handler {
-    type Incoming = httparse::Response<'static, 'static>;
-    type Outgoing = http::Request;
-
-    fn on_incoming(&mut self, incoming: http::IncomingResponse, stream: http::Stream,
-                  transfer: http::Transfer<http::Request, Fresh>) {
-        let resp = response::new(incoming, stream);
-    }
-}
 */
 
-/// Options for an individual Request.
-///
-/// One of these will be built for you if you use one of the convenience
-/// methods, such as `get()`, `post()`, etc.
-pub struct RequestBuilder<'a, C: NetworkConnector + 'a> {
-    client: &'a Client<C>,
-    // We store a result here because it's good to keep RequestBuilder
-    // from being generic, but it is a nicer API to report the error
-    // from `send` (when other errors may be happening, so it already
-    // returns a `Result`). Why's it good to keep it non-generic? It
-    // stops downstream crates having to remonomorphise and recompile
-    // the code, which can take a while, since `send` is fairly large.
-    // (For an extreme example, a tiny crate containing
-    // `hyper::Client::new().get("x").send().unwrap();` took ~4s to
-    // compile with a generic RequestBuilder, but 2s with this scheme,)
-    url: Result<Url, UrlError>,
-    headers: Option<Headers>,
-    method: Method,
-    //body: Option<Body<'a>>,
+struct Message<H: Handler<T>, T: Transport> {
+    handler: H,
+    _marker: PhantomData<T>,
 }
 
-impl<'a, C: NetworkConnector> RequestBuilder<'a, C> {
 
-    /*
-    /// Set a request body to be sent.
-    pub fn body<B: Into<Body<'a>>>(mut self, body: B) -> RequestBuilder<'a> {
-        self.body = Some(body.into());
-        self
-    }
-    */
+impl<H: Handler<T>, T: Transport> http::MessageHandler for Message<H, T> {
+    type Message = http::ClientMessage;
 
-    /// Add additional headers to the request.
-    pub fn headers(mut self, headers: Headers) -> RequestBuilder<'a, C> {
-        self.headers = Some(headers);
-        self
+    fn on_outgoing(&mut self, head: &mut RequestHead) -> Next {
+        let mut req = request::nead(head);
+        self.handler.on_request(&mut req)
     }
 
-    /// Add an individual new header to the request.
-    pub fn header<H: Header + HeaderFormat>(mut self, header: H) -> RequestBuilder<'a, C> {
-        {
-            let mut headers = match self.headers {
-                Some(ref mut h) => h,
-                None => {
-                    self.headers = Some(Headers::new());
-                    self.headers.as_mut().unwrap()
-                }
-            };
-
-            headers.set(header);
-        }
-        self
+    fn on_encode(&mut self, transport: &mut http::Encoder<T>) -> Next {
+        self.handler.on_request_writable(transport)
     }
 
-    /// Execute this request and receive a Response back.
-    pub fn send<F>(self, cb: F) where F: FnOnce(::Result<Response>) + Send + 'static {
-        self.connect(move |result| {
-            match result {
-                Ok(request) => request.start(move |result| {
-                    match result {
-                        Ok(request) => request.response(cb),
-                        Err(e) => cb(Err(e))
-                    }
-                }),
-                Err(e) => cb(Err(e))
-            }
-        })
+    fn on_incoming(&mut self, head: http::ResponseHead) -> Next {
+        trace!("on_incoming {:?}", head);
+        let resp = response::new(head);
+        self.handler.on_response(resp)
     }
 
-    fn connect<F>(self, callback: F) where F: FnOnce(::Result<Request<Fresh>>) + Send + 'static {
-        match self.try_connect() {
-            Ok(_) => (),
-            Err(e) => return callback(Err(e))
-        }
-        //let mut req = try!(request::new(method, url, transfer));
-        //req.headers_mut().extend(headers);
-        //Ok(req)
-        unimplemented!()
+    fn on_decode(&mut self, transport: &mut http::Decoder<T>) -> Next {
+        self.handler.on_response_readable(transport)
     }
+}
 
-    fn try_connect(self) -> ::Result<()> {
-        let RequestBuilder { client, method, url, headers } = self;
-        let url = try!(url);
-        trace!("send {:?} {:?}", method, url);
-
-<<<<<<< HEAD
-        let can_have_body = match method {
-            Method::Get | Method::Head => false,
-=======
-        let transport = {
-            let (host, port) = try!(get_host_and_port(&url));
-            // let key = key(host, port, url.scheme);
-            // let transfer = match client.pool.remove(key) {
-            //     Some(transfer) => transfer,
-            //     None => try!(client.connector.connect(&host, port, &*url.scheme))
-            // };
-            // transfer.start(method, url, headers)
-            try!(client.connector.connect(&host, port, &*url.scheme))
-        };
-        unimplemented!()
-        //let id = try!(client.tick.stream(transport));
-        //Ok((id, method, url, headers))
-    }
 
     /*
     fn _send(self) -> ::Result<Response> {
@@ -301,7 +186,6 @@ impl<'a, C: NetworkConnector> RequestBuilder<'a, C> {
 
         let can_have_body = match &method {
             &Method::Get | &Method::Head => false,
->>>>>>> e3e42b5... mio wip
             _ => true
         };
 
@@ -367,68 +251,6 @@ impl<'a, C: NetworkConnector> RequestBuilder<'a, C> {
         }
     }
     */
-}
-
-/*
-/// An enum of possible body types for a Request.
-pub enum Body<'a> {
-    /// A Reader does not necessarily know it's size, so it is chunked.
-    ChunkedBody(&'a mut (Read + 'a)),
-    /// For Readers that can know their size, like a `File`.
-    SizedBody(&'a mut (Read + 'a), u64),
-    /// A String has a size, and uses Content-Length.
-    BufBody(&'a [u8] , usize),
-}
-
-impl<'a> Body<'a> {
-    fn size(&self) -> Option<u64> {
-        match *self {
-            Body::SizedBody(_, len) => Some(len),
-            Body::BufBody(_, len) => Some(len as u64),
-            _ => None
-        }
-    }
-}
-
-impl<'a> Read for Body<'a> {
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match *self {
-            Body::ChunkedBody(ref mut r) => r.read(buf),
-            Body::SizedBody(ref mut r, _) => r.read(buf),
-            Body::BufBody(ref mut r, _) => Read::read(r, buf),
-        }
-    }
-}
-
-impl<'a> Into<Body<'a>> for &'a [u8] {
-    #[inline]
-    fn into(self) -> Body<'a> {
-        Body::BufBody(self, self.len())
-    }
-}
-
-impl<'a> Into<Body<'a>> for &'a str {
-    #[inline]
-    fn into(self) -> Body<'a> {
-        self.as_bytes().into()
-    }
-}
-
-impl<'a> Into<Body<'a>> for &'a String {
-    #[inline]
-    fn into(self) -> Body<'a> {
-        self.as_bytes().into()
-    }
-}
-
-impl<'a, R: Read> From<&'a mut R> for Body<'a> {
-    #[inline]
-    fn from(r: &'a mut R) -> Body<'a> {
-        Body::ChunkedBody(r)
-    }
-}
-*/
 
 /// A helper trait to convert common objects into a Url.
 pub trait IntoUrl {

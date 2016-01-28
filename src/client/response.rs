@@ -7,7 +7,7 @@ use http::{self, RawStatus};
 use status;
 use version;
 
-pub fn new(incoming: http::ResponseHead, stream: http::IncomingStream) -> Response {
+pub fn new(incoming: http::ResponseHead) -> Response {
     trace!("Response::new");
     let status = status::StatusCode::from_u16(incoming.subject.0);
     debug!("version={:?}, status={:?}", incoming.version, status);
@@ -19,7 +19,6 @@ pub fn new(incoming: http::ResponseHead, stream: http::IncomingStream) -> Respon
         headers: incoming.headers,
         //url: url,
         status_raw: incoming.subject,
-        body: stream,
     }
 
 }
@@ -32,7 +31,6 @@ pub struct Response {
     version: version::HttpVersion,
     //url: Url,
     status_raw: RawStatus,
-    body: http::IncomingStream,
 }
 
 impl Response {
@@ -55,23 +53,6 @@ impl Response {
     /// Get the HTTP version of this response from the server.
     #[inline]
     pub fn version(&self) -> &version::HttpVersion { &self.version }
-
-    /*
-    pub fn stream<R: http::Read + Send + 'static>(mut self, r: R) {
-        self.body.read(Box::new(r));
-    }
-    */
-
-    pub fn on_read<T: ::http::Read + Send + 'static>(self, callback: T) {
-        self.body.read(callback);
-    }
-
-    pub fn read<F>(self, callback: F) where F: FnOnce(::Result<(&[u8], Self)>) + Send + 'static {
-        let stream = self.body.clone();
-        stream.read(::http::events::ReadOnce::new(move |result| {
-            callback(result.map(move |data| (data, self)))
-        }));
-    }
 }
 
 /*
