@@ -8,7 +8,6 @@ use std::string::FromUtf8Error;
 use httparse;
 use url;
 use solicit::http::HttpError as Http2Error;
-use tick::Error as TickError;
 
 #[cfg(feature = "openssl")]
 use openssl::ssl::error::SslError;
@@ -159,23 +158,12 @@ impl From<Http2Error> for Error {
     }
 }
 
-impl From<TickError> for Error {
-    fn from(err: TickError) -> Error {
-        match err {
-            TickError::Io(e) => Error::Io(e),
-            TickError::TooManySockets => panic!("too many sockets, what do i do"),
-            TickError::Timeout => panic!("too many timeouts, what do i do")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
     use std::io;
     use httparse;
     use solicit::http::HttpError as Http2Error;
-    use tick::Error as TickError;
     use url;
     use super::Error;
     use super::Error::*;
@@ -227,7 +215,6 @@ mod tests {
         from!(httparse::Error::Token => Header);
         from!(httparse::Error::TooManyHeaders => TooLarge);
         from!(httparse::Error::Version => Version);
-        from!(TickError::Io(io::Error::new(io::ErrorKind::Other, "tickerror")) => Io(..));
     }
 
     #[cfg(feature = "openssl")]

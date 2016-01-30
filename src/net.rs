@@ -3,27 +3,29 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use mio::tcp::{TcpStream, TcpListener};
-use mio::{Selector, Token, EventSet, PollOpt, TryAccept};
-use tick::{self, Evented};
-
-//#[cfg(windows)]
-//pub use tick::Transport;
+use mio::{Selector, Token, Evented, EventSet, PollOpt, TryAccept};
 
 #[cfg(feature = "openssl")]
 pub use self::openssl::Openssl;
 
 #[cfg(not(windows))]
-pub trait Transport: tick::Transport + ::std::os::unix::io::AsRawFd {}
+pub trait Transport: Read + Write + Evented + ::std::os::unix::io::AsRawFd {}
 
 #[cfg(not(windows))]
-impl<T: tick::Transport + ::std::os::unix::io::AsRawFd> Transport for T {}
+impl<T: Read + Write + Evented + ::std::os::unix::io::AsRawFd> Transport for T {}
+
+#[cfg(windows)]
+pub trait Transport: Read + Write + Evented {}
+
+#[cfg(windows)]
+impl<T: Read + Write + Evented> Transport for T {}
 
 /// A connector creates a NetworkStream.
-pub trait NetworkConnector {
+pub trait Connect {
     /// Type of Stream to create
-    type Stream: Transport;
+    type Output: Transport;
     /// Connect to a remote address.
-    fn connect(&self, host: &str, port: u16, scheme: &str) -> ::Result<Self::Stream>;
+    fn connect(&self, host: &str, port: u16, scheme: &str) -> ::Result<Self::Output>;
 }
 
 /// An alias to `mio::tcp::TcpStream`.
@@ -36,8 +38,8 @@ pub type HttpListener = TcpListener;
 #[derive(Debug, Clone, Default)]
 pub struct HttpConnector;
 
-impl NetworkConnector for HttpConnector {
-    type Stream = TcpStream;
+impl Connect for HttpConnector {
+    type Output = TcpStream;
 
     fn connect(&self, host: &str, port: u16, scheme: &str) -> ::Result<TcpStream> {
         let addr = (host, port).to_socket_addrs().unwrap().next().unwrap();
@@ -75,8 +77,8 @@ impl NetworkConnector for HttpConnector {
 ///     b.connect(&(addr, port))
 /// });
 /// ```
-impl<F> NetworkConnector for F where F: Fn(&str, u16, &str) -> io::Result<TcpStream> {
-    type Stream = TcpStream;
+impl<F> Connect for F where F: Fn(&str, u16, &str) -> io::Result<TcpStream> {
+    type Output = TcpStream;
 
     fn connect(&self, host: &str, port: u16, scheme: &str) -> ::Result<TcpStream> {
         Ok(try!((*self)(host, port, scheme)))
@@ -245,7 +247,7 @@ fn _assert_transport() {
 }
 
 /*
-impl<S: Ssl> NetworkConnector for HttpsConnector<S> {
+impl<S: Ssl> Connect for HttpsConnector<S> {
     type Stream = HttpsStream<<S as Ssl>::Stream>;
 
     fn connect(&self, host: &str, port: u16, scheme: &str) -> ::Result<Self::Stream> {

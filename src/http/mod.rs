@@ -16,7 +16,7 @@ use version::HttpVersion::{Http10, Http11};
 #[cfg(feature = "serde-serialization")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use self::conn::{Conn, MessageHandler, Next};
+pub use self::conn::{Conn, MessageHandler, MessageHandlerFactory, Next};
 
 mod buffer;
 mod conn;

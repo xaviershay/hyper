@@ -140,11 +140,11 @@ extern crate cookie;
 extern crate unicase;
 extern crate httparse;
 extern crate num_cpus;
+extern crate rotor;
 extern crate traitobject;
 extern crate typeable;
 extern crate solicit;
 extern crate mio;
-extern crate tick;
 extern crate vecio;
 
 #[macro_use]

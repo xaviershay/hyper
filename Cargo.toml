@@ -18,6 +18,7 @@ log = "0.3"
 mime = "0.1"
 mio = "0.5"
 num_cpus = "0.2"
+#rotor = "0.4"
 rustc-serialize = "0.3"
 time = "0.1"
 traitobject = "0.0.1"
@@ -30,13 +31,12 @@ vecio = "0.1"
 version = "0.2"
 default-features = false
 
-[dependencies.tick]
-#git = "https://github.com/seanmonstar/tick"
-path = "../tick"
-
 [dependencies.openssl]
 version = "0.7"
 optional = true
+
+[dependencies.rotor]
+git = "https://github.com/tailhook/rotor"
 
 [dependencies.solicit]
 version = "0.4"
